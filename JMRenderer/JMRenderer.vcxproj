@@ -133,6 +133,10 @@
     <ClInclude Include="external\imstb_truetype.h" />
     <ClInclude Include="JMRenderer.h" />
     <ClInclude Include="Resource.h" />
+    <ClInclude Include="src\grid\GridMesh.h" />
+    <ClInclude Include="src\utils\BMTexture.h" />
+    <ClInclude Include="src\utils\camera\Camera.h" />
+    <ClInclude Include="src\utils\Math.h" />
     <ClInclude Include="targetver.h" />
   </ItemGroup>
   <ItemGroup>
@@ -151,7 +155,10 @@
     <ClCompile Include="external\imgui_draw.cpp" />
     <ClCompile Include="external\imgui_tables.cpp" />
     <ClCompile Include="external\imgui_widgets.cpp" />
+    <ClCompile Include="src\grid\GridMesh.cpp" />
     <ClCompile Include="src\main.cpp" />
+    <ClCompile Include="src\utils\BMPTexture.cpp" />
+    <ClCompile Include="src\utils\camera\Camera.cpp" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">

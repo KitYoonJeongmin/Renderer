@@ -8,6 +8,11 @@
 #include <filesystem>
 #include <vector>
 #include <cassert>
+#include <cmath>
+
+#include "grid/GridMesh.h"
+#include "utils/camera/Camera.h"
+#include "utils/BMTexture.h"
 
 #pragma comment(lib, "d3d11.lib")
 #pragma comment(lib, "dxgi.lib")
@@ -25,6 +30,52 @@ using Microsoft::WRL::ComPtr;
 static HINSTANCE GInstance = nullptr;
 static HWND      GWnd = nullptr;
 static UINT      GWidth = 1600, GHeight = 900;
+
+//struct SceneCB {
+//    DirectX::XMFLOAT4X4 WVP;     // World*View*Proj (Transpose 해서 보냄)
+//    DirectX::XMFLOAT3   LightDir;// 정규화된 방향(예: -0.5, -1, -0.3)
+//    float _pad0 = 0.0f;        // 16바이트 정렬
+//};
+
+/// <summary>
+/// 씬
+/// </summary>
+struct SceneCB {
+    DirectX::XMMATRIX WVP; // World*View*Proj (Transpose 해서 보냄)
+
+    // 정규화된 방향(예: -0.5, -1, -0.3)
+    DirectX::XMFLOAT3   LightDir;  
+    float _pad0 = 0.0f; // 16바이트 정렬
+
+    DirectX::XMFLOAT3   FogColor;  
+    float FogDensity = 0.06f;
+
+
+    DirectX::XMFLOAT3   CamPos;    
+    float _pad1 = 0.0f;
+};
+
+static ComPtr<ID3D11Buffer> GSceneCB;
+
+/// <summary>
+/// 와이어 프레임
+/// </summary>
+static bool GWireframe = false;
+static ComPtr<ID3D11RasterizerState> GRS_Solid;
+static ComPtr<ID3D11RasterizerState> GRS_Wire;
+
+// 알베도 텍스처 3장
+static ComPtr<ID3D11ShaderResourceView> GTexGrass, GTexRock, GTexSnow;
+static ComPtr<ID3D11SamplerState>       GAlbedoSamp;
+
+// 스플랫 임계값(필요시 ImGui에서 조정)
+static float GH_GrassMax = 0.35f;   // 이 높이까지는 잔디 가중치↑
+static float GH_SnowMin = 0.75f;   // 이 높이부터는 눈 가중치↑
+static float GS_SlopeLo = 0.45f;   // 이 경사부터 바위 가중치 시작
+static float GS_SlopeHi = 0.85f;   // 이 경사에서 바위 가중치=1
+static float GUvScale = 8.0f;    // 타일링
+static float GBlendBand = 0.08f;   // 높이 전이 부드러움
+
 
 static void HR(HRESULT hr) { assert(SUCCEEDED(hr)); }
 LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam);
@@ -188,47 +239,172 @@ private:
     ComPtr<ID3D11PixelShader>  mPS;
 };
 
-// ---------------- Triangle ----------------
-struct Vertex { float pos[3]; float col[3]; };
-struct Triangle {
-    ComPtr<ID3D11Buffer> VB;
-    void Init(ID3D11Device* d) {
-        Vertex v[3] = {
-            {{0,0.5f,0},{1,0,0}}, {{0.5f,-0.5f,0},{0,1,0}}, {{-0.5f,-0.5f,0},{0,0,1}}
-        };
-        D3D11_BUFFER_DESC bd{ sizeof(v),D3D11_USAGE_DEFAULT,D3D11_BIND_VERTEX_BUFFER };
-        D3D11_SUBRESOURCE_DATA init{ v };
-        HR(d->CreateBuffer(&bd, &init, VB.GetAddressOf()));
-    }
-    void Bind(ID3D11DeviceContext* c) {
-        UINT s = sizeof(Vertex), o = 0;
-        ID3D11Buffer* b = VB.Get();
-        c->IASetVertexBuffers(0, 1, &b, &s, &o);
-        c->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-    }
+// ── Heightmap 리소스 ───────────────────────────────────────────
+static ComPtr<ID3D11ShaderResourceView> GHeightSRV;
+static ComPtr<ID3D11SamplerState>       GHeightSamp;
+
+// ── Terrain 상수버퍼(b1) ──────────────────────────────────────
+struct TerrainCBCPU {
+    float HeightScale; 
+    float padA[3];     // 16바이트 정렬
+    DirectX::XMFLOAT2 GridSize;           // (worldX, worldZ)
+    DirectX::XMFLOAT2 TexelSize;          // (1/texW, 1/texH)
 };
+static ComPtr<ID3D11Buffer> GTerrainCB;
+
+// ── Mat 상수버퍼(b2) ──────────────────────────────────────
+struct MatCBCPU 
+{ 
+    DirectX::XMFLOAT4 thresholds; 
+    float band; 
+    float _pad[3]; 
+    float uvScale; 
+    float _pad2[3]; 
+};
+static ComPtr<ID3D11Buffer> GMatCB;
+static UINT GhmW = 0, GhmH = 0;
+
+// ── UI/그리드 파라미터 (그리드 생성에 쓰는 값과 일치) ─────────
+static int   GGridRows = 64, GGridCols = 64;
+static float GGridSizeX = 10.0f, GGridSizeZ = 10.0f;
+static float GHeightScale = 1.5f;   // ImGui에서 조절할 값
+static DirectX::XMFLOAT3 GFogColor = { 0.6f, 0.7f, 0.8f };
+static float             GFogDensity = 0.06f;
 
 // ---------------- Globals ----------------
 static DeviceResources GDev;
 static ShaderProgram   GShader;
-static Triangle        GTri;
+static GridMesh        GGrid;
+static CameraFPS GCam;
 static float           GClear[4] = { 0.1f,0.1f,0.1f,1 };
 static bool            GVsync = true;
 
 // ---------------- Init/Loop ----------------
 static void InitAll() {
     GDev.Initialize(GWnd, GWidth, GHeight);
-    D3D11_INPUT_ELEMENT_DESC l[] = {
-        {"POSITION",0,DXGI_FORMAT_R32G32B32_FLOAT,0,0,D3D11_INPUT_PER_VERTEX_DATA,0},
-        {"COLOR",0,DXGI_FORMAT_R32G32B32_FLOAT,0,12,D3D11_INPUT_PER_VERTEX_DATA,0} };
-    GShader.Init(GDev.Dev(), L"assets/shaders/simple_vs.hlsl", L"assets/shaders/simple_ps.hlsl", l, 2);
-    GTri.Init(GDev.Dev());
+
+    /*
+     * BuildInputLayoutDesc 생성
+     * GridMesh로 전달
+     */
+    std::vector<D3D11_INPUT_ELEMENT_DESC> layout;
+    GridMesh::BuildInputLayoutDesc(layout);
+
+    /*
+    * tODO: 파일 Path를 한 파이렝 모으도록 개선
+    */
+    GShader.Init(
+        GDev.Dev(),
+        L"assets/shaders/grid/terrain_vs.hlsl",   // ← 테레인용 VS
+        L"assets/shaders/grid/terrain_ps.hlsl",   // ← 테레인용 PS
+        layout.data(),
+        (UINT)layout.size()
+    );
+
+    // 카메라 세팅
+    GCam.SetPosition({ 0.f, 2.f, -5.f });
+    GCam.SetMoveSpeed(8.f);
+    GCam.SetTurnSpeed(2.0f);
+
+    D3D11_BUFFER_DESC cbd{};
+    UINT sz = (UINT)sizeof(SceneCB);
+    cbd.ByteWidth = (sz + 15u) & ~15u; // 16바이트 정렬
+    cbd.Usage = D3D11_USAGE_DYNAMIC;
+    cbd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+    cbd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+    HR(GDev.Dev()->CreateBuffer(&cbd, nullptr, GSceneCB.GetAddressOf()));
 
     IMGUI_CHECKVERSION();
     ImGui::CreateContext();
     ImGui::StyleColorsDark();
     ImGui_ImplWin32_Init(GWnd);
     ImGui_ImplDX11_Init(GDev.Dev(), GDev.Ctx());
+
+    //////////////////////////////////////
+    ////////// Heightmap ////////////////
+    // ── (A) CPU에서 256×256 높이맵 생성 (sin/cos 패턴) ─────────────
+    const UINT texW = 256, texH = 256;
+    std::vector<uint8_t> hm(texW * texH);
+    for (UINT y = 0; y < texH; ++y) {
+        for (UINT x = 0; x < texW; ++x) {
+            float u = (float)x / (texW - 1);
+            float v = (float)y / (texH - 1);
+            float h = 0.5f + 0.5f * (sinf(u * 8.0f) * cosf(v * 6.0f)); // 0~1
+            hm[y * texW + x] = (uint8_t)std::round(h * 255.0f);
+        }
+    }
+
+    // ── (B) Texture2D + SRV ───────────────────────────────────────
+    D3D11_TEXTURE2D_DESC td{};
+    td.Width = texW; td.Height = texH; td.MipLevels = 1; td.ArraySize = 1;
+    td.Format = DXGI_FORMAT_R8_UNORM;
+    td.SampleDesc.Count = 1;
+    td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+    D3D11_SUBRESOURCE_DATA srd{};
+    srd.pSysMem = hm.data();
+    srd.SysMemPitch = texW * sizeof(uint8_t);
+
+    ComPtr<ID3D11Texture2D> tex;
+    HR(GDev.Dev()->CreateTexture2D(&td, &srd, tex.GetAddressOf()));
+
+    D3D11_SHADER_RESOURCE_VIEW_DESC srvd{};
+    srvd.Format = td.Format;
+    srvd.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+    srvd.Texture2D.MostDetailedMip = 0;
+    srvd.Texture2D.MipLevels = 1;
+    HR(GDev.Dev()->CreateShaderResourceView(tex.Get(), &srvd, GHeightSRV.GetAddressOf()));
+
+    // ── (C) SamplerState ──────────────────────────────────────────
+    D3D11_SAMPLER_DESC sd{};
+    sd.Filter = D3D11_FILTER_MIN_MAG_MIP_LINEAR;
+    sd.AddressU = sd.AddressV = sd.AddressW = D3D11_TEXTURE_ADDRESS_WRAP;
+    sd.MaxLOD = D3D11_FLOAT32_MAX;
+    HR(GDev.Dev()->CreateSamplerState(&sd, GHeightSamp.GetAddressOf()));
+
+    // ── (D) Terrain CB(b1) 생성 ───────────────────────────────────
+    //D3D11_BUFFER_DESC cbd{};
+    cbd.ByteWidth = ((UINT)sizeof(TerrainCBCPU) + 15u) & ~15u;
+    cbd.Usage = D3D11_USAGE_DYNAMIC;
+    cbd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+    cbd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+    HR(GDev.Dev()->CreateBuffer(&cbd, nullptr, GTerrainCB.GetAddressOf())); 
+
+    // 그리드 생성
+    GGrid.Init(GDev.Dev(), GGridRows, GGridCols, GGridSizeX, GGridSizeZ);
+
+    // 와이어프레임
+    D3D11_RASTERIZER_DESC rs{}; 
+    rs.FillMode = D3D11_FILL_SOLID; 
+    rs.CullMode = D3D11_CULL_BACK; 
+    rs.DepthClipEnable = TRUE;
+    HR(GDev.Dev()->CreateRasterizerState(&rs, GRS_Solid.GetAddressOf()));
+    
+    rs.FillMode = D3D11_FILL_WIREFRAME;
+    HR(GDev.Dev()->CreateRasterizerState(&rs, GRS_Wire.GetAddressOf()));
+
+    // 텍스쳐
+
+    D3D11_BUFFER_DESC bd{}; 
+    bd.ByteWidth = ((UINT)sizeof(MatCBCPU) + 15) & ~15; 
+    bd.Usage = D3D11_USAGE_DYNAMIC; 
+    bd.BindFlags = D3D11_BIND_CONSTANT_BUFFER; 
+    bd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+    HR(GDev.Dev()->CreateBuffer(&bd, nullptr, GMatCB.GetAddressOf()));
+
+    
+    BMP::LoadR8(GDev.Dev(), L"assets\\heightmaps\\hm.bmp", GHeightSRV, &GhmW, &GhmH);
+    
+    BMP::LoadRGBA8(GDev.Dev(), L"assets\\textures\\grass.bmp", GTexGrass);
+    BMP::LoadRGBA8(GDev.Dev(), L"assets\\textures\\rock.bmp", GTexRock);
+    BMP::LoadRGBA8(GDev.Dev(), L"assets\\textures\\snow.bmp", GTexSnow);
+
+    D3D11_SAMPLER_DESC asd{};
+    asd.Filter = D3D11_FILTER_MIN_MAG_MIP_LINEAR;
+    asd.AddressU = D3D11_TEXTURE_ADDRESS_WRAP;
+    asd.AddressV = D3D11_TEXTURE_ADDRESS_WRAP;
+    asd.AddressW = D3D11_TEXTURE_ADDRESS_WRAP;
+    asd.MaxLOD = D3D11_FLOAT32_MAX;
+    HR(GDev.Dev()->CreateSamplerState(&asd, GAlbedoSamp.GetAddressOf()));
 }
 static void ShutdownAll() {
     ImGui_ImplDX11_Shutdown();
@@ -239,13 +415,108 @@ static void RenderFrame() {
     GShader.TryHotReload();
     GDev.BeginFrame(GClear);
     auto* c = GDev.Ctx();
-    GShader.Bind(c); GTri.Bind(c);
-    c->Draw(3, 0);
+    ID3D11Buffer* cb = GSceneCB.Get();
+
+    // dt 계산 (고정 프레임이 아니면)
+    static LARGE_INTEGER freq{}, prev{};
+    if (freq.QuadPart == 0) { QueryPerformanceFrequency(&freq); QueryPerformanceCounter(&prev); }
+    LARGE_INTEGER now; QueryPerformanceCounter(&now);
+    float dt = float(now.QuadPart - prev.QuadPart) / float(freq.QuadPart);
+    prev = now;
+
+    // 카메라 업데이트
+    GCam.UpdateFromKeyboardWin32(dt);
+
+    // 행렬 계산
+    float aspect = (float)GWidth / (float)GHeight;
+    DirectX::XMMATRIX World = DirectX::XMMatrixIdentity();
+    DirectX::XMMATRIX View = GCam.View();
+    DirectX::XMMATRIX Proj = GCam.Proj(aspect);
+
+    // 상수버퍼 업로드
+    
+    SceneCB scb{};
+    scb.WVP = DirectX::XMMatrixTranspose(World * View * Proj);
+    scb.LightDir = { -0.4f, -1.0f, -0.3f };
+    scb.FogColor = GFogColor;
+    scb.FogDensity = GFogDensity;
+    scb.CamPos = GCam.Position();
+
+    D3D11_MAPPED_SUBRESOURCE m{};
+    HR(c->Map(cb, 0, D3D11_MAP_WRITE_DISCARD, 0, &m));
+    memcpy(m.pData, &scb, sizeof(SceneCB));
+    c->Unmap(cb, 0);
+
+    // ── Terrain CB(b1) 채우기 ───────────────────────────────
+    TerrainCBCPU tcb{};
+    tcb.HeightScale = GHeightScale;
+    tcb.GridSize = { GGridSizeX, GGridSizeZ };
+    //tcb.TexelSize = { 1.0f / 256.0f, 1.0f / 256.0f }; // 우리가 만든 높이맵 크기
+    tcb.TexelSize = { 1.0f / float(GhmW), 1.0f / float(GhmH) };
+
+    D3D11_MAPPED_SUBRESOURCE mt{};
+    HR(c->Map(GTerrainCB.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &mt));
+    memcpy(mt.pData, &tcb, sizeof(TerrainCBCPU));
+    c->Unmap(GTerrainCB.Get(), 0);
+
+    // VS/PS에 바인딩
+    ID3D11Buffer* cb1 = GTerrainCB.Get();
+    c->VSSetConstantBuffers(1, 1, &cb1);
+    c->PSSetConstantBuffers(1, 1, &cb1);
+    
+    // Heightmap 리소스를 바인딩 
+    ID3D11ShaderResourceView* srv = GHeightSRV.Get();
+    ID3D11SamplerState* s = GHeightSamp.Get();
+    c->VSSetShaderResources(0, 1, &srv);
+    c->VSSetSamplers(0, 1, &s);
+
+    MatCBCPU mat{};
+    mat.thresholds = { GH_GrassMax, GH_SnowMin, GS_SlopeLo, GS_SlopeHi };
+    mat.band = GBlendBand;
+    mat.uvScale = GUvScale;
+
+    D3D11_MAPPED_SUBRESOURCE mat_map{};
+    HR(c->Map(GMatCB.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &mat_map));
+    memcpy(mat_map.pData, &mat, sizeof(mat));
+    c->Unmap(GMatCB.Get(), 0);
+
+    ID3D11Buffer* b2 = GMatCB.Get();
+    c->PSSetConstantBuffers(2, 1, &b2);
+
+
+    c->RSSetState(GWireframe ? GRS_Wire.Get() : GRS_Solid.Get());
+
+
+    GShader.Bind(c);
+    GGrid.Bind(c);
+    c->DrawIndexed(GGrid.IndexCount(), 0, 0);
+    c->VSSetConstantBuffers(0, 1, &cb);
+    c->PSSetConstantBuffers(0, 1, &cb);
+
+    ID3D11ShaderResourceView* srvs[3] = { GTexGrass.Get(), GTexRock.Get(), GTexSnow.Get() };
+    ID3D11SamplerState* samp = GAlbedoSamp.Get();
+    c->PSSetShaderResources(0, 3, srvs); // t0,t1,t2
+    c->PSSetSamplers(0, 1, &samp);       // s0
+
 
     ImGui_ImplDX11_NewFrame(); ImGui_ImplWin32_NewFrame(); ImGui::NewFrame();
     ImGui::Begin("HUD");
     ImGui::ColorEdit3("Clear", GClear);
     ImGui::Checkbox("VSync", &GVsync);
+    ImGui::SliderFloat("HeightScale", &GHeightScale, 0.0f, 10.0f, "%.2f");
+
+    ImGui::SliderFloat("UV Scale", &GUvScale, 1.0f, 32.0f, "%.1f");
+    ImGui::SliderFloat("H GrassMax", &GH_GrassMax, 0.0f, 1.0f);
+    ImGui::SliderFloat("H SnowMin", &GH_SnowMin, 0.0f, 1.0f);
+    ImGui::SliderFloat("Slope Lo", &GS_SlopeLo, 0.0f, 1.0f);
+    ImGui::SliderFloat("Slope Hi", &GS_SlopeHi, 0.0f, 1.0f);
+    ImGui::SliderFloat("Blend Band", &GBlendBand, 0.01f, 0.2f, "%.2f");
+
+    ImGui::ColorEdit3("FogColor", &GFogColor.x);
+    ImGui::SliderFloat("FogDensity", &GFogDensity, 0.0f, 0.2f, "%.3f");
+
+    ImGui::Checkbox("Wireframe", &GWireframe);
+
     ImGui::End();
     ImGui::Render();
     ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());
@@ -280,10 +551,20 @@ int APIENTRY wWinMain(HINSTANCE h, HINSTANCE, LPWSTR, int n) {
     return 0;
 }
 LRESULT CALLBACK WndProc(HWND hWnd, UINT m, WPARAM w, LPARAM l) {
+    /*
+    * 우선순위
+    * 1. ImGui
+    * 2. GCam
+    */
     if (ImGui_ImplWin32_WndProcHandler(hWnd, m, w, l))
     {
         return true;
     }
+    if (ImGui::GetCurrentContext() != nullptr && GCam.HandleWin32MouseMsg(hWnd, m, w, l, ImGui::GetIO().WantCaptureMouse))
+    {
+        return true;
+    }
+        
 
     switch (m) {
     case WM_SIZE:
